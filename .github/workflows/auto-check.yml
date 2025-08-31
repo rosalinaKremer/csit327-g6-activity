@@ -1,0 +1,163 @@
+name: Auto-Checks
+on:
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  basic-checks:
+    runs-on: ubuntu-latest
+    env:
+      # Bypass when the PR author is the owner OR the PR has the 'instructor-bypass' label
+      BYPASS: ${{ github.actor == 'blissfuljuan' || contains(github.event.pull_request.labels.*.name, 'instructor-bypass') }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      # Pre-checks BYPASS switch (owner or label)
+      - name: Bypass notice (owner) or instructor-bypass label
+        if: ${{ env.BYPASS == 'true' }}
+        run: echo "Bypass active for ${{ github.actor }} — enforcement steps will be skipped."
+
+      # 1) Enforce branch naming: must start with the student's GitHub username
+      - name: Ensure branch naming (username prefix)
+        if: ${{ env.BYPASS != 'true' }}
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          USER="${{ github.actor }}"
+          echo "Branch: $BRANCH / Actor: $USER"
+          if ! echo "$BRANCH" | grep -E "^${USER}/"; then
+            echo "Branch must start with your GitHub username: ${USER}/"; exit 1; fi
+
+      # 2) Commit message quality + must reference an issue number
+      - name: Check commit messages + issue refs
+        if: ${{ env.BYPASS != 'true' }}
+        run: |
+          git log origin/main..HEAD --pretty=format:'%s' -n 50 | tee commits.txt
+          if ! grep -E '^(feat|fix|docs|chore|refactor|test|style|perf|setup)(\(.+\))?: ' commits.txt; then
+            echo "Use conventional commits (e.g., feat: message)"; exit 1; fi
+          if ! grep -E '#[0-9]+' commits.txt; then
+            echo "Reference an issue number like (#1) in at least one commit"; exit 1; fi
+
+      # 3) Locate THIS PR's bio file (kept from your original)
+      - name: Locate bio file for this PR
+        id: bio
+        if: ${{ env.BYPASS != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          USER="${{ github.actor }}"
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          # 1) Bio files added/modified in THIS PR
+          mapfile -t changed < <(git diff --name-only --diff-filter=AM "$BASE".."$HEAD" -- 'students/*-bio.md' || true)
+
+          pick=""
+          if (( ${#changed[@]} == 1 )); then
+            pick="${changed[0]}"
+          elif (( ${#changed[@]} > 1 )); then
+            # Prefer the one that mentions @username
+            for f in "${changed[@]}"; do
+              if grep -qF "@${USER}" "$f"; then pick="$f"; break; fi
+            done
+            [[ -z "$pick" ]] && pick="${changed[0]}"
+          fi
+
+          # 2) Fallback: search any existing bio that mentions @username
+          if [[ -z "$pick" ]]; then
+            pick="$(grep -rlF "@${USER}" students/*-bio.md 2>/dev/null | head -n1 || true)"
+          fi
+
+          if [[ -z "$pick" ]]; then
+            echo "Could not determine your bio file. Make sure you added students/<lastname>-<firstname>-bio.md and included your @${USER}" >&2
+            exit 1
+          fi
+
+          echo "bio_file=$pick" >> "$GITHUB_OUTPUT"
+          echo "Found bio: $pick"
+
+      # 4) NEW: Find exactly one group contributors file changed at repo root
+      - name: Locate group contributors file (root-level)
+        id: grp
+        if: ${{ env.BYPASS != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+
+          # Collect added/modified files in THIS PR that match "*-CONTRIBUTORS.md"
+          # Using a git pathspec with '*' matches only the repo root (no '/')
+          mapfile -t gfiles < <(git diff --name-only --diff-filter=AM "$BASE".."$HEAD" -- '*-CONTRIBUTORS.md' || true)
+
+          # (Optional safety) Keep only true root-level matches (no '/'); not strictly needed,
+          # but preserves intent even if patterns change later.
+          if (( ${#gfiles[@]} > 0 )); then
+            mapfile -t gfiles < <(printf "%s\n" "${gfiles[@]}" | grep -E '^[^/]+-CONTRIBUTORS\.md$' || true)
+          fi
+
+          if (( ${#gfiles[@]} == 0 )); then
+            echo "No group contributors file changed. Edit your group file (e.g., CSIT327-CONTRIBUTORS.md) at the repo root." >&2
+            exit 1
+          fi
+          if (( ${#gfiles[@]} > 1 )); then
+            printf "Multiple group contributor files changed:\n%s\n" "${gfiles[@]}" >&2
+            echo "Change exactly ONE group file." >&2
+            exit 1
+          fi
+
+          FILE="${gfiles[0]}"
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "group_file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "Found group file: $FILE"
+
+      # 5) Verify PR author's @username appears in that group file (bullet line)
+      - name: Verify @username present in group contributors file
+        if: ${{ env.BYPASS != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          USER="${{ github.actor }}"
+          FILE="${{ steps.grp.outputs.group_file }}"
+          echo "Checking $FILE for '- Lastname, Firstname (**@${USER}**)' format"
+
+          # Accept -, *, or + bullets, any spaces, then @username
+          # After the username, require a non-username char or EOL (prevents partial matches)
+          if ! grep -En "^[-*+][[:space:]]+[^@]*,[[:space:]]+[^@]*[[:space:]]\\((\\*\\*)?@${USER}(\\*\\*)?\\)[[:space:]]*$" "$FILE" >/dev/null; then
+            echo "❌ Couldn't find a properly formatted line for @${USER} in $FILE" >&2
+            echo "Please add a line exactly like this (with your own name):" >&2
+            echo "- Lastname, Firstname (**@${USER}**)" >&2
+            echo "" >&2
+            echo "— Debug: showing lines with parentheses+@ handles —" >&2
+            grep -En "^[-*+][[:space:]].*\\((\\*\\*)?@.*(\\*\\*)?\\).*$" "$FILE" || true
+            exit 1
+          fi
+
+          echo "✅ Found bullet line with @${USER} in $FILE"
+
+      # 6) (Optional) Ensure only minimal additions were made to that group file
+      - name: Ensure only one new roster line added (optional)
+        if: ${{ env.BYPASS != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          FILE="${{ steps.grp.outputs.group_file }}"
+          ADDED=$(git diff --unified=0 "$BASE".."$HEAD" -- "$FILE" \
+                  | grep -E '^\+' | grep -vE '^\+\+\+ ' | wc -l || true)
+          if [ "$ADDED" -gt 3 ]; then
+            echo "Too many additions in $FILE. Add only your single roster line." >&2
+            exit 1
+          fi
+          echo "ℹ️ Added lines in $FILE: $ADDED"
+
+      # 7) Bio file must include the student's @username (kept from original)
+      - name: Verify @username present in bio
+        if: ${{ env.BYPASS != 'true' }}
+        run: |
+          USER="${{ github.actor }}"
+          BIO_FILE="${{ steps.bio.outputs.bio_file }}"
+          if ! grep -F "@${USER}" "$BIO_FILE" >/dev/null; then
+            echo "Your GitHub username (@${USER}) must appear in $BIO_FILE"; exit 1; fi
